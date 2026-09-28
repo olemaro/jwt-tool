@@ -213,32 +213,44 @@ jwt-tool encode --payload '{"sub":"alice"}' --secret 'do-not-do-this-in-real-lif
 
 ```bash
 pip install -e ".[dev]"
-pytest                      # unit + integration suite
-python scripts/smoke.py     # end-to-end smoke test against the real CLI
+
+python scripts/run-tests.py     # both suites + artifacts, one command
 ```
 
-The two suites overlap on purpose. `pytest` exercises the API in-process;
-`scripts/smoke.py` types commands at the CLI the way a person would, covering
-argument parsing, exit codes and the stdout/stderr split. Each has caught
-defects the other missed. `smoke.py` prints one PASS/FAIL line per check and
-exits non-zero on any failure, so it drops straight into CI.
+Or run them separately:
 
-`pyproject.toml` sets `pythonpath = ["src"]` in `[tool.pytest.ini_options]`,
-so `pytest` finds the `jwt_tool` package straight from `src/` — no separate
-install step is required before running the suite; installing the `dev`
-extra just gets you `pytest` itself.
+```bash
+pytest                          # unit + integration (182 tests)
+python scripts/smoke.py         # end-to-end against the real CLI (72 checks)
+```
 
-## Design notes
+`scripts/run-tests.py` runs both — a pytest failure does not skip the smoke
+test, since "does the CLI still work at all" is exactly what you want to know
+when the unit tests are red — and writes `artifacts/`:
 
-- `src/` layout: the importable package lives under `src/jwt_tool`, keeping
-  the repo root free of anything that could shadow the installed package.
-- stdout carries only the machine-parseable result (the decoded JSON, or the
-  bare encoded token); every warning, prompt, and error goes to stderr — so
-  `jwt-tool` is safe to pipe into `jq` or capture straight into a variable.
-- See [docs/CONTRACT.md](docs/CONTRACT.md) for the frozen CLI/module
-  contract this tool is built against, and
-  [docs/LIBRARY-EVALUATION.md](docs/LIBRARY-EVALUATION.md) for why PyJWT was
-  chosen over the alternatives that were considered.
+| File | Contents |
+| --- | --- |
+| `summary.md`, `summary.json` | Totals, coverage, pass/fail |
+| `pytest-junit.xml`, `smoke-junit.xml` | JUnit reports, for CI |
+| `smoke.log` | Full transcript: every command, its exit code, its output |
+| `smoke-results.json` | One structured record per smoke check |
+| `coverage.xml`, `coverage-html/` | Coverage report |
+
+The smoke run narrates itself. Each check prints the command it invoked, the
+exit code, stdout and stderr, and what it observed — so a failure is readable
+without a debugger, and a pass can be audited instead of trusted:
+
+```text
+  $ jwt-tool decode a.b.c.d
+    exit=1  (456 ms)
+    stdout: <empty>
+    stderr: error: Invalid header padding
+  PASS  malformed (four segments): non-zero exit, no traceback, empty stdout
+```
+
+The secret is masked before anything is printed or written, so no artifact
+carries it. `--quiet` drops the transcript for CI; `--no-artifacts` writes
+nothing.
 
 ## Documentation
 

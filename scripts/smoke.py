@@ -17,20 +17,77 @@ overlap on purpose: each has caught defects the other missed.
 """
 from __future__ import annotations
 
+import argparse
 import base64
+import datetime
 import json
 import os
 import pathlib
+import platform
+import shlex
 import subprocess
 import sys
 import tempfile
+import time
+import xml.etree.ElementTree as ET
+
+# This suite prints tokens, payloads and error messages verbatim, and one of the
+# payloads is deliberately non-ASCII. A Windows console defaults to cp1252, where
+# print() would raise UnicodeEncodeError and abort the run, so force UTF-8 and
+# degrade gracefully if the stream cannot be reconfigured (e.g. when piped by a
+# harness that replaced it).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 PY = sys.executable
-SECRET = "acceptance-sentinel-secret-do-not-leak-0123456789"
+SECRET = "smoke-sentinel-secret-do-not-leak-0123456789678"
 PAYLOAD = '{"sub":"1234567890","name":"John Doe","admin":false,"n":42}'
 
+parser = argparse.ArgumentParser(
+    description="End-to-end smoke test for jwt-tool.",
+    epilog="Artifacts: smoke.log (transcript), smoke-results.json, smoke-junit.xml",
+)
+parser.add_argument("--out", metavar="DIR", default=str(REPO_ROOT / "artifacts"),
+                    help="directory for artifacts (default: ./artifacts)")
+parser.add_argument("--no-artifacts", action="store_true",
+                    help="print the transcript but write no files")
+parser.add_argument("-q", "--quiet", action="store_true",
+                    help="only PASS/FAIL lines and the summary, no command transcript")
+ARGS = parser.parse_args()
+
+#: Every line printed, kept verbatim for smoke.log.
+TRANSCRIPT: list[str] = []
+#: (ok, name, detail) per check -- the summary reads this.
 results: list[tuple[bool, str, str]] = []
+#: One record per check, for smoke-results.json and the JUnit report.
+RECORDS: list[dict] = []
+CURRENT_SECTION = "0. setup"
+STARTED = time.time()
+
+
+def mask(text: str) -> str:
+    """Never let the secret reach the transcript, a log file or a CI console."""
+    return text.replace(SECRET, "<SECRET:" + str(len(SECRET)) + "-chars-redacted>")
+
+
+def say(line: str = "", *, quiet_ok: bool = True) -> None:
+    """Print a line and record it. quiet_ok=False means --quiet suppresses it."""
+    line = mask(line)
+    TRANSCRIPT.append(line)
+    if quiet_ok or not ARGS.quiet:
+        print(line)
+
+
+def trace(line: str = "") -> None:
+    """Transcript detail -- suppressed by --quiet, still written to smoke.log."""
+    line = mask(line)
+    TRANSCRIPT.append(line)
+    if not ARGS.quiet:
+        print(line)
 
 
 def b64u(raw: bytes) -> str:
@@ -43,30 +100,98 @@ def make_token(header: dict, payload: object, sig: str = "x") -> str:
     return f"{h}.{p}.{sig}"
 
 
+def _abbrev(value: str, limit: int = 220) -> str:
+    value = value.replace("\r\n", "\n").strip()
+    if not value:
+        return "<empty>"
+    single = " \u23ce ".join(value.splitlines())
+    return single if len(single) <= limit else single[:limit] + " \u2026"
+
+
 def run(args: list[str], *, stdin: str | None = None, env: dict | None = None):
+    """Invoke the CLI in a separate process and narrate exactly what happened."""
     environ = {**os.environ, **(env or {})}
     # Also work from a bare checkout, not just an installed package: mirrors the
     # `pythonpath = ["src"]` that pyproject.toml already gives pytest.
     src_dir = str(REPO_ROOT / "src")
     prior = environ.get("PYTHONPATH")
     environ["PYTHONPATH"] = f"{src_dir}{os.pathsep}{prior}" if prior else src_dir
-    return subprocess.run(
+
+    shown = "jwt-tool " + " ".join(shlex.quote(a) for a in args)
+    extras = []
+    if env:
+        extras.append("env " + " ".join(f"{k}={mask(v)}" for k, v in env.items()))
+    if stdin is not None:
+        extras.append(f"stdin={_abbrev(stdin, 60)!r}")
+    trace("  $ " + shown + (("   [" + "; ".join(extras) + "]") if extras else ""))
+
+    started = time.time()
+    proc = subprocess.run(
         [PY, "-m", "jwt_tool", *args],
         capture_output=True, text=True, input=stdin, cwd=REPO_ROOT, env=environ,
     )
+    trace(f"    exit={proc.returncode}  ({(time.time() - started) * 1000:.0f} ms)")
+    trace(f"    stdout: {_abbrev(proc.stdout)}")
+    trace(f"    stderr: {_abbrev(proc.stderr)}")
+    return proc
 
 
 def check(name: str, cond: object, detail: str = "") -> bool:
+    """Record one assertion. Detail is shown on pass as well as on failure.
+
+    Showing it on a pass is the point: the transcript then states what was
+    actually observed, so a reader can audit the claim instead of trusting a
+    bare PASS.
+    """
     ok = bool(cond)
     results.append((ok, name, detail))
-    print(("PASS  " if ok else "FAIL  ") + name)
-    if not ok and detail:
-        print(f"        {detail}")
+    RECORDS.append({"section": CURRENT_SECTION, "name": name,
+                    "ok": ok, "detail": mask(detail)})
+    say(("  PASS  " if ok else "  FAIL  ") + name)
+    if detail:
+        if ok:
+            trace("          observed: " + _abbrev(detail))
+        else:
+            say("          observed: " + _abbrev(detail, 400))
     return ok
 
 
+#: What each section proves, and why it is worth proving. Printed under the
+#: heading so the transcript explains itself to someone who has never read the
+#: source.
+WHY = {
+    "1.": "The task documents this exact invocation, so it must work verbatim -- and\n"
+          "   using --secret on the command line must warn about argv/history exposure.",
+    "2.": "Plain `decode` needs no key. It must print parseable JSON on stdout, keep the\n"
+          "   warning on stderr so `| jq` still works, and admit it verified nothing.",
+    "3.": "Verification must actually reject: wrong key, a payload tampered with while\n"
+          "   reusing a valid signature (the CVE-2022-39227 shape), and alg:none.",
+    "4.": "Malformed input is the normal case for a CLI. Every shape must fail with a\n"
+          "   clean message and a non-zero exit -- never a traceback, never partial output.",
+    "5.": "The secret must be suppliable without putting it in argv. All four sources must\n"
+          "   agree on the same secret, and a missing source must fail loudly, not silently.",
+    "6.": "Bad payloads and bad usage are different failures: exit 1 for the former,\n"
+          "   exit 2 for the latter, so a script can tell 'the token was bad' from 'I\n"
+          "   called this wrong'.",
+    "7.": "`--help` is part of the deliverable. It must list both subcommands and document\n"
+          "   the secure secret flags.",
+    "8.": "The requirement 'the generated token should be decodable by your tool', proven\n"
+          "   through the CLI only, for every supported algorithm and payload shape.",
+    "9.": "One check per defect found during review. Each of these passed the original\n"
+          "   test suite and still shipped a bug, so they are pinned here permanently.",
+}
+
+
 def section(title: str) -> None:
-    print("\n" + "=" * 72 + f"\n{title}\n" + "=" * 72)
+    global CURRENT_SECTION
+    CURRENT_SECTION = title
+    say()
+    say("=" * 74)
+    say(title)
+    why = WHY.get(title.split()[0])
+    if why:
+        say("   " + why)
+    say("=" * 74)
 
 
 section("1. Task statement verbatim: encode --payload '<json>' --secret '<secret>'")
@@ -294,12 +419,70 @@ check("short secret warns for HS256 too, without printing the secret",
 if os.path.exists(secret_file):
     os.remove(secret_file)
 
-failed = [(n, d) for ok, n, d in results if not ok]
-print("\n" + "=" * 72)
-print(f"RESULT: {len(results) - len(failed)}/{len(results)} passed, {len(failed)} failed")
-if failed:
-    print("\nFAILURES:")
-    for name, detail in failed:
-        print(f"  - {name}\n      {detail}")
-print("=" * 72)
-sys.exit(1 if failed else 0)
+
+def finish() -> int:
+    failed = [(n, d) for ok, n, d in results if not ok]
+    passed = len(results) - len(failed)
+    elapsed = time.time() - STARTED
+
+    say()
+    say("=" * 74)
+    say(f"RESULT: {passed}/{len(results)} checks passed, {len(failed)} failed "
+        f"in {elapsed:.1f}s")
+    by_section: dict[str, list[bool]] = {}
+    for rec in RECORDS:
+        by_section.setdefault(rec["section"], []).append(rec["ok"])
+    for name, oks in by_section.items():
+        mark = "ok  " if all(oks) else "FAIL"
+        say(f"  [{mark}] {sum(oks)}/{len(oks)}  {name}")
+    if failed:
+        say()
+        say("FAILURES:")
+        for name, detail in failed:
+            say(f"  - {name}")
+            say(f"      {_abbrev(detail, 400)}")
+    say("=" * 74)
+
+    if not ARGS.no_artifacts:
+        out = pathlib.Path(ARGS.out)
+        out.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+        (out / "smoke.log").write_text("\n".join(TRANSCRIPT) + "\n", encoding="utf-8")
+
+        (out / "smoke-results.json").write_text(json.dumps({
+            "suite": "jwt-tool smoke",
+            "started_utc": stamp,
+            "duration_seconds": round(elapsed, 3),
+            "python": sys.version.split()[0],
+            "platform": platform.platform(),
+            "interpreter": PY,
+            "totals": {"checks": len(results), "passed": passed, "failed": len(failed)},
+            "checks": RECORDS,
+        }, indent=2) + "\n", encoding="utf-8")
+
+        suite = ET.Element("testsuite", name="jwt-tool.smoke",
+                           tests=str(len(results)), failures=str(len(failed)),
+                           errors="0", skipped="0", time=f"{elapsed:.3f}",
+                           timestamp=stamp)
+        for rec in RECORDS:
+            case = ET.SubElement(suite, "testcase",
+                                 classname="smoke." + rec["section"].split(".")[0],
+                                 name=rec["name"])
+            if not rec["ok"]:
+                ET.SubElement(case, "failure",
+                              message=rec["detail"] or "check failed").text = rec["detail"]
+        tree = ET.ElementTree(ET.Element("testsuites"))
+        tree.getroot().append(suite)
+        ET.indent(tree, space="  ")
+        tree.write(out / "smoke-junit.xml", encoding="utf-8", xml_declaration=True)
+
+        say()
+        say("Artifacts written to " + str(out) + ":")
+        for fname in ("smoke.log", "smoke-results.json", "smoke-junit.xml"):
+            say(f"  {(out / fname).stat().st_size:>8} B  {fname}")
+
+    return 1 if failed else 0
+
+
+sys.exit(finish())

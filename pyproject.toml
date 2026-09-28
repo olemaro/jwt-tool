@@ -26,7 +26,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = [
+    "pytest>=7",
+    "pytest-cov>=4",   # scripts/run-tests.py emits coverage artifacts
+]
 
 [project.scripts]
 jwt-tool = "jwt_tool.cli:main"

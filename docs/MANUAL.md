@@ -270,18 +270,49 @@ restricted the algorithm without asking for verification. Add `--verify`.
 
 ```bash
 pip install -e ".[dev]"
-pytest                      # unit and integration suite
-python scripts/smoke.py     # end-to-end smoke test against the real CLI
+
+python scripts/run-tests.py     # both suites + artifacts, one command
 ```
 
-`pytest` needs no install step from a checkout: `pyproject.toml` sets
-`pythonpath = ["src"]`. `scripts/smoke.py` adds `src` to `PYTHONPATH` itself,
-prints one PASS/FAIL line per check, and exits non-zero if any fails.
+Or run them separately:
 
-The two suites overlap on purpose. The unit suite exercises the API in-process;
-the smoke test types commands at the CLI the way a person would, covering
-argument parsing, exit codes and the stdout/stderr split. Each has caught
-defects the other missed.
+```bash
+pytest                          # unit + integration (182 tests)
+python scripts/smoke.py         # end-to-end against the real CLI (72 checks)
+```
+
+`scripts/run-tests.py` runs both — a pytest failure does not skip the smoke
+test, since "does the CLI still work at all" is exactly what you want to know
+when the unit tests are red — and writes `artifacts/`:
+
+| File | Contents |
+| --- | --- |
+| `summary.md`, `summary.json` | Totals, coverage, pass/fail |
+| `pytest-junit.xml`, `smoke-junit.xml` | JUnit reports, for CI |
+| `smoke.log` | Full transcript: every command, its exit code, its output |
+| `smoke-results.json` | One structured record per smoke check |
+| `coverage.xml`, `coverage-html/` | Coverage report |
+
+The smoke run narrates itself. Each check prints the command it invoked, the
+exit code, stdout and stderr, and what it observed — so a failure is readable
+without a debugger, and a pass can be audited instead of trusted:
+
+```text
+  $ jwt-tool decode a.b.c.d
+    exit=1  (456 ms)
+    stdout: <empty>
+    stderr: error: Invalid header padding
+  PASS  malformed (four segments): non-zero exit, no traceback, empty stdout
+```
+
+The secret is masked before anything is printed or written, so no artifact
+carries it. `--quiet` drops the transcript for CI; `--no-artifacts` writes
+nothing.
+
+The two suites overlap on purpose. `pytest` exercises the API in-process; the
+smoke test types commands at the CLI the way a person would, covering argument
+parsing, exit codes and the stdout/stderr split. Each has caught defects the
+other missed.
 
 See [SCENARIOS.md](SCENARIOS.md) for worked end-to-end scenarios with expected
 output.
