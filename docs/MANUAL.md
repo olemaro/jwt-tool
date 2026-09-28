@@ -12,6 +12,7 @@ signed with HMAC.
 - [Exit codes](#exit-codes)
 - [What verification does and does not cover](#what-verification-does-and-does-not-cover)
 - [Algorithms and key length](#algorithms-and-key-length)
+- [Running it on Windows](#running-it-on-windows)
 - [Troubleshooting](#troubleshooting)
 - [Running the test suites](#running-the-test-suites)
 
@@ -265,6 +266,68 @@ algorithm outside `HS256`/`HS384`/`HS512`, possibly `none`.
 restricted the algorithm without asking for verification. Add `--verify`.
 
 **No output and exit code 2** — a usage error; the message is on stderr.
+
+## Running it on Windows
+
+Three things trip people up, none of them specific to this tool.
+
+**`python` on PATH is not the virtualenv's Python.** Changing directory into
+`.venv\Scripts` does not help, because `.` is not on `PATH` on Windows — `python`
+still resolves to the system interpreter, which has no PyJWT, and every command
+fails with `ModuleNotFoundError: No module named 'jwt'`. Either activate the
+environment once, or name the interpreter explicitly:
+
+```powershell
+# Activate once, then use the short names for the rest of the session
+.\.venv\Scripts\Activate.ps1
+jwt-tool --version
+
+# Or be explicit every time, without activating
+.\.venv\Scripts\jwt-tool.exe --version
+.\.venv\Scripts\python.exe -m jwt_tool --version
+```
+
+`scripts/smoke.py` checks this before it runs anything and tells you which
+interpreter it used if the CLI cannot start.
+
+**Do not run `src/jwt_tool/cli.py` directly.** It defines `main()` and has no
+`if __name__ == "__main__"` block, so running it as a file exits 0 and does
+nothing at all. The entry points are the `jwt-tool` command and
+`python -m jwt_tool`.
+
+**JSON payloads quote normally in PowerShell 7.** Single quotes outside, double
+quotes inside, exactly as in the POSIX examples:
+
+```powershell
+jwt-tool encode --payload '{"sub":"alice","role":"admin"}' --secret-env JWT_TOOL_SECRET
+```
+
+If a payload is awkward to quote, build it as an object or pipe it in instead:
+
+```powershell
+$payload = @{ sub = "alice"; role = "admin" } | ConvertTo-Json -Compress
+$payload | jwt-tool encode --payload - --secret-env JWT_TOOL_SECRET
+```
+
+Decoded output is JSON, so it becomes a PowerShell object directly:
+
+```powershell
+$d = jwt-tool decode $token --verify --secret-env JWT_TOOL_SECRET 2>$null | ConvertFrom-Json
+$d.payload.role          # admin
+$d.signature_verified    # True
+```
+
+The `2>$null` drops the stderr warnings from the pipeline; without it
+`ConvertFrom-Json` still works, since the warnings never went to stdout.
+
+**Saving a run's output.** `Tee-Object` shows it and saves it at once:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\smoke.py 2>&1 | Tee-Object -FilePath run.txt
+```
+
+For the smoke suite this is redundant — it already writes the full transcript to
+`artifacts/smoke.log` itself.
 
 ## Running the test suites
 
