@@ -146,6 +146,7 @@ def main() -> int:
         "| `smoke-junit.xml` | JUnit report for the smoke checks |",
         "| `smoke.log` | Full transcript: every command run, its exit code and output |",
         "| `smoke-results.json` | One structured record per smoke check |",
+        "| `smoke-tokens.json`, `smoke-tokens.txt` | Every JWT the run touched, decoded |",
         "| `coverage.xml`, `coverage-html/` | Coverage, for a badge or a browsable report |",
         "| `summary.md`, `summary.json` | This summary |",
         "",

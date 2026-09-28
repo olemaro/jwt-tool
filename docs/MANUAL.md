@@ -291,6 +291,7 @@ when the unit tests are red — and writes `artifacts/`:
 | `pytest-junit.xml`, `smoke-junit.xml` | JUnit reports, for CI |
 | `smoke.log` | Full transcript: every command, its exit code, its output |
 | `smoke-results.json` | One structured record per smoke check |
+| `smoke-tokens.json`, `smoke-tokens.txt` | Every JWT the run touched, with its decoded header and payload |
 | `coverage.xml`, `coverage-html/` | Coverage report |
 
 The smoke run narrates itself. Each check prints the command it invoked, the

@@ -65,6 +65,9 @@ TRANSCRIPT: list[str] = []
 results: list[tuple[bool, str, str]] = []
 #: One record per check, for smoke-results.json and the JUnit report.
 RECORDS: list[dict] = []
+#: Every distinct JWT seen during the run, keyed by the token itself, so the
+#: tokens are usable afterwards instead of buried in the transcript.
+TOKENS: dict[str, dict] = {}
 CURRENT_SECTION = "0. setup"
 STARTED = time.time()
 
@@ -100,6 +103,51 @@ def make_token(header: dict, payload: object, sig: str = "x") -> str:
     return f"{h}.{p}.{sig}"
 
 
+def _looks_like_jwt(value: str) -> bool:
+    """Three dot-separated segments, no whitespace. Deliberately loose."""
+    parts = value.split(".")
+    return (len(parts) == 3 and not any(c.isspace() for c in value)
+            and all(parts[:2]) and len(value) > 20)
+
+
+def _decode_locally(token: str) -> dict:
+    """Decode a token's segments here, without the tool and without verifying.
+
+    Independent of jwt_tool on purpose: this is evidence about what the tool
+    produced, so it must not be produced by the thing under test.
+    """
+    out: dict = {}
+    parts = token.split(".")
+    for name, segment in (("header", parts[0]), ("payload", parts[1])):
+        try:
+            padded = segment + "=" * (-len(segment) % 4)
+            out[name] = json.loads(base64.urlsafe_b64decode(padded))
+        except Exception as exc:                      # noqa: BLE001
+            out[name] = f"<undecodable: {type(exc).__name__}: {exc}>"
+    out["signature_b64"] = parts[2]
+    out["signature_present"] = bool(parts[2])
+    return out
+
+
+def note_token(token: str, origin: str, *, source: str) -> None:
+    """Record a token once, with where it came from. Later sightings are added."""
+    token = token.strip()
+    if not _looks_like_jwt(token):
+        return
+    entry = TOKENS.get(token)
+    if entry is None:
+        TOKENS[token] = {
+            "token": token,
+            "source": source,
+            "first_seen_in": mask(origin),
+            "seen_count": 1,
+            "section": CURRENT_SECTION,
+            **_decode_locally(token),
+        }
+    else:
+        entry["seen_count"] += 1
+
+
 def _abbrev(value: str, limit: int = 220) -> str:
     value = value.replace("\r\n", "\n").strip()
     if not value:
@@ -108,14 +156,65 @@ def _abbrev(value: str, limit: int = 220) -> str:
     return single if len(single) <= limit else single[:limit] + " \u2026"
 
 
-def run(args: list[str], *, stdin: str | None = None, env: dict | None = None):
-    """Invoke the CLI in a separate process and narrate exactly what happened."""
+def _child_env(env: dict | None = None) -> dict:
+    """Environment for the CLI subprocess.
+
+    Puts `src` on PYTHONPATH so the suite also works from a bare checkout, not
+    just an installed package -- the same thing `pythonpath = ["src"]` does for
+    pytest in pyproject.toml.
+    """
     environ = {**os.environ, **(env or {})}
-    # Also work from a bare checkout, not just an installed package: mirrors the
-    # `pythonpath = ["src"]` that pyproject.toml already gives pytest.
     src_dir = str(REPO_ROOT / "src")
     prior = environ.get("PYTHONPATH")
     environ["PYTHONPATH"] = f"{src_dir}{os.pathsep}{prior}" if prior else src_dir
+    return environ
+
+
+def preflight() -> None:
+    """Refuse to run 72 doomed checks if the CLI cannot start at all.
+
+    The common case is invoking this script with the system interpreter instead
+    of the virtualenv's, so PyJWT is missing. Every check would then fail
+    identically and the suite would crash later on an empty token, telling the
+    reader nothing useful.
+    """
+    probe = subprocess.run(
+        [PY, "-m", "jwt_tool", "--version"],
+        capture_output=True, text=True, cwd=REPO_ROOT, env=_child_env(),
+    )
+    if probe.returncode == 0:
+        say(f"jwt-tool under test: {probe.stdout.strip()}")
+        say(f"interpreter:         {PY}")
+        say(f"repository:          {REPO_ROOT}")
+        return
+
+    detail = (probe.stderr or probe.stdout).strip()
+    missing = "No module named 'jwt'" in detail
+
+    print("PREFLIGHT FAILED: the jwt-tool CLI could not start, so no check would")
+    print("be meaningful. Nothing was run.\n")
+    print(f"  interpreter: {PY}")
+    print(f"  command:     {PY} -m jwt_tool --version")
+    print(f"  exit code:   {probe.returncode}")
+    print("  error:       " + (detail.splitlines()[-1] if detail else "<no output>"))
+    if missing:
+        print("\nPyJWT is not installed for THIS interpreter. Most likely this script")
+        print("was run with the system Python instead of the project virtualenv.\n")
+        print("  Windows:  .venv\\Scripts\\python.exe scripts\\smoke.py")
+        print("  POSIX:    .venv/bin/python scripts/smoke.py\n")
+        print("Or set the virtualenv up first:\n")
+        print("  python -m venv .venv")
+        print("  .venv\\Scripts\\Activate.ps1        # POSIX: source .venv/bin/activate")
+        print('  pip install -e ".[dev]"')
+    else:
+        print("\nFull output:\n")
+        print(detail)
+    sys.exit(2)
+
+
+def run(args: list[str], *, stdin: str | None = None, env: dict | None = None):
+    """Invoke the CLI in a separate process and narrate exactly what happened."""
+    environ = _child_env(env)
 
     shown = "jwt-tool " + " ".join(shlex.quote(a) for a in args)
     extras = []
@@ -133,6 +232,12 @@ def run(args: list[str], *, stdin: str | None = None, env: dict | None = None):
     trace(f"    exit={proc.returncode}  ({(time.time() - started) * 1000:.0f} ms)")
     trace(f"    stdout: {_abbrev(proc.stdout)}")
     trace(f"    stderr: {_abbrev(proc.stderr)}")
+
+    # A token on stdout was produced by `encode`; one in argv was handed to
+    # `decode`, which includes the hand-built attack cases.
+    note_token(proc.stdout, shown, source="produced by encode")
+    for arg in args:
+        note_token(arg, shown, source="input to decode")
     return proc
 
 
@@ -193,6 +298,8 @@ def section(title: str) -> None:
         say("   " + why)
     say("=" * 74)
 
+
+preflight()
 
 section("1. Task statement verbatim: encode --payload '<json>' --secret '<secret>'")
 r = run(["encode", "--payload", PAYLOAD, "--secret", SECRET])
@@ -477,9 +584,47 @@ def finish() -> int:
         ET.indent(tree, space="  ")
         tree.write(out / "smoke-junit.xml", encoding="utf-8", xml_declaration=True)
 
+        tokens = list(TOKENS.values())
+        (out / "smoke-tokens.json").write_text(json.dumps({
+            "note": ("Test fixtures. Every token here is signed with the "
+                     "suite's fixed sentinel secret, which is public in "
+                     "scripts/smoke.py -- they prove nothing and grant nothing. "
+                     "The secret itself is never written to any artifact."),
+            "started_utc": stamp,
+            "count": len(tokens),
+            "tokens": tokens,
+        }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+        lines = [
+            "jwt-tool smoke run - tokens seen",
+            f"generated {stamp}",
+            "",
+            "Test fixtures, signed with the suite's fixed sentinel secret (public",
+            "in scripts/smoke.py). They prove nothing and grant nothing. The",
+            "secret itself appears in no artifact.",
+            "",
+        ]
+        for i, entry in enumerate(tokens, 1):
+            lines.append("=" * 78)
+            lines.append(f"[{i}/{len(tokens)}]  {entry['source']}"
+                         + (f"   (seen {entry['seen_count']}x)"
+                            if entry["seen_count"] > 1 else ""))
+            lines.append(f"section: {entry['section']}")
+            lines.append(f"from:    {entry['first_seen_in']}")
+            lines.append("")
+            lines.append(entry["token"])
+            lines.append("")
+            lines.append("  header:    " + json.dumps(entry["header"], ensure_ascii=False))
+            lines.append("  payload:   " + json.dumps(entry["payload"], ensure_ascii=False))
+            lines.append("  signature: " + (entry["signature_b64"] or "<empty - unsigned>"))
+            lines.append("")
+        (out / "smoke-tokens.txt").write_text("\n".join(lines), encoding="utf-8")
+
         say()
+        say(f"Captured {len(tokens)} distinct tokens -> smoke-tokens.json / .txt")
         say("Artifacts written to " + str(out) + ":")
-        for fname in ("smoke.log", "smoke-results.json", "smoke-junit.xml"):
+        for fname in ("smoke.log", "smoke-results.json", "smoke-junit.xml",
+                      "smoke-tokens.json", "smoke-tokens.txt"):
             say(f"  {(out / fname).stat().st_size:>8} B  {fname}")
 
     return 1 if failed else 0
