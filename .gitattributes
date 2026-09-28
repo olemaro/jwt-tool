@@ -1,0 +1,4 @@
+# Normalise line endings so a checkout on Windows and one on Linux/macOS
+# produce identical blobs. Without this, files committed from Windows carry
+# CRLF and every cross-platform diff is noise.
+* text=auto eol=lf

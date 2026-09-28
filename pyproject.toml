@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=77"]  # PEP 639 SPDX `license` string
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jwt-tool"
+version = "1.0.0"
+description = "Command-line tool for decoding, encoding and HMAC-signing JSON Web Tokens (JWTs)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "olemaro" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Environment :: Console",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Utilities",
+]
+dependencies = [
+    # >=2.11: core.py imports InsecureKeyLengthWarning, added in 2.11.0
+    "PyJWT>=2.11",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+jwt-tool = "jwt_tool.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
